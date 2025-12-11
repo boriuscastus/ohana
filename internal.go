@@ -1,0 +1,295 @@
+package ohana
+
+import (
+	"bufio"
+	"context"
+	"crypto/rand"
+	"encoding/binary"
+	"fmt"
+	"log"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/gotd/td/session"
+	"github.com/gotd/td/telegram"
+	"github.com/gotd/td/telegram/auth"
+	"github.com/gotd/td/telegram/uploader"
+	"github.com/gotd/td/tg"
+)
+
+// ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
+
+// generateRandomID генерирует случайный ID для сообщения
+func generateRandomID() int64 {
+	var buf [8]byte
+	rand.Read(buf[:])
+	return -int64(binary.LittleEndian.Uint64(buf[:]) & 0x7fffffffffffffff)
+}
+
+// findBotFather находит пользователя BotFather
+func findBotFather(ctx context.Context, api *tg.Client) (*tg.InputPeerUser, error) {
+	resolved, err := api.ContactsResolveUsername(ctx, &tg.ContactsResolveUsernameRequest{
+		Username: "BotFather",
+	})
+	if err != nil {
+		return nil, fmt.Errorf("не удалось найти BotFather: %w", err)
+	}
+
+	var botFatherUser *tg.User
+	for _, user := range resolved.Users {
+		if u, ok := user.(*tg.User); ok && u.Username == "BotFather" {
+			botFatherUser = u
+			break
+		}
+	}
+
+	if botFatherUser == nil {
+		return nil, fmt.Errorf("BotFather не найден")
+	}
+
+	return &tg.InputPeerUser{
+		UserID:     botFatherUser.ID,
+		AccessHash: botFatherUser.AccessHash,
+	}, nil
+}
+
+// sendMessage отправляет сообщение
+func sendMessage(ctx context.Context, api *tg.Client, peer tg.InputPeerClass, text string) error {
+	_, err := api.MessagesSendMessage(ctx, &tg.MessagesSendMessageRequest{
+		Peer:      peer,
+		Message:   text,
+		RandomID:  generateRandomID(),
+		NoWebpage: true,
+	})
+
+	if err != nil {
+		return fmt.Errorf("не удалось отправить сообщение: %w", err)
+	}
+
+	log.Printf("📤 Отправлено: %s", text)
+	time.Sleep(1 * time.Second)
+	return nil
+}
+
+// getLastMessage получает последнее сообщение от собеседника
+func getLastMessage(ctx context.Context, api *tg.Client, peer tg.InputPeerClass) (string, error) {
+	history, err := api.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{
+		Peer:  peer,
+		Limit: 1,
+	})
+
+	if err != nil {
+		return "", fmt.Errorf("не удалось получить историю: %w", err)
+	}
+
+	// Обрабатываем разные типы ответов
+	switch h := history.(type) {
+	case *tg.MessagesChannelMessages:
+		if len(h.Messages) > 0 {
+			if msg, ok := h.Messages[0].(*tg.Message); ok && !msg.Out {
+				log.Printf("📥 Получено: %s", msg.Message)
+				return msg.Message, nil
+			}
+		}
+	case *tg.MessagesMessages:
+		if len(h.Messages) > 0 {
+			if msg, ok := h.Messages[0].(*tg.Message); ok && !msg.Out {
+				log.Printf("📥 Получено: %s", msg.Message)
+				return msg.Message, nil
+			}
+		}
+	case *tg.MessagesMessagesSlice:
+		if len(h.Messages) > 0 {
+			if msg, ok := h.Messages[0].(*tg.Message); ok && !msg.Out {
+				log.Printf("📥 Получено: %s", msg.Message)
+				return msg.Message, nil
+			}
+		}
+	}
+
+	return "", nil
+}
+
+// waitForResponseWithChecks ждет ответ с проверкой ошибок
+func waitForResponseWithChecks(ctx context.Context, api *tg.Client, peer tg.InputPeerClass, keywords []string, timeout time.Duration) (string, error) {
+	deadline := time.After(timeout)
+
+	for {
+		select {
+		case <-deadline:
+			return "", fmt.Errorf("таймаут ожидания ответа (ключевые слова: %v)", keywords)
+		case <-ctx.Done():
+			return "", ctx.Err()
+		default:
+			msg, err := getLastMessage(ctx, api, peer)
+			if err != nil {
+				return "", err
+			}
+
+			// Проверяем на ошибки BotFather
+			if err := CheckBotFatherError(msg); err != nil {
+				return "", err
+			}
+
+			if IsPrompt(msg, keywords) {
+				return msg, nil
+			}
+
+			time.Sleep(2 * time.Second)
+		}
+	}
+}
+
+// sendMessageWithRetry отправляет сообщение с повторными попытками
+func sendMessageWithRetry(ctx context.Context, api *tg.Client, peer tg.InputPeerClass, text string, maxRetries int) error {
+	var lastErr error
+
+	for i := 0; i < maxRetries; i++ {
+		err := sendMessage(ctx, api, peer, text)
+		if err == nil {
+			return nil
+		}
+
+		lastErr = err
+
+		// Проверяем, не слишком ли много попыток
+		errStr := err.Error()
+		if strings.Contains(errStr, ErrTooManyAttempts) ||
+			strings.Contains(errStr, ErrRateLimited) {
+			return err
+		}
+
+		// Ждем перед следующей попыткой
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Duration(i+1) * time.Second):
+			continue
+		}
+	}
+
+	return fmt.Errorf("не удалось отправить сообщение после %d попыток: %w", maxRetries, lastErr)
+}
+
+// sendPhoto отправляет фото
+func sendPhoto(ctx context.Context, api *tg.Client, peer tg.InputPeerClass, filePath string) error {
+	// Открываем файл
+	file, err := os.Open(filePath)
+	if err != nil {
+		return fmt.Errorf("не удалось открыть файл: %w", err)
+	}
+	defer file.Close()
+
+	// Проверяем размер
+	fileInfo, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("не удалось получить информацию о файле: %w", err)
+	}
+
+	if fileInfo.Size() > 10*1024*1024 { // 10 MB
+		return fmt.Errorf("файл слишком большой (максимум 10 MB)")
+	}
+
+	filename := filepath.Base(filePath)
+	log.Printf("📤 Отправляем фото: %s (%.2f MB)", filename,
+		float64(fileInfo.Size())/1024/1024)
+
+	// Создаем uploader
+	upd := uploader.NewUploader(api)
+
+	// Загружаем файл
+	upload, err := upd.Upload(ctx, uploader.NewUpload(filename, file, fileInfo.Size()))
+	if err != nil {
+		return fmt.Errorf("ошибка загрузки: %w", err)
+	}
+
+	// Отправляем как Photo
+	_, err = api.MessagesSendMedia(ctx, &tg.MessagesSendMediaRequest{
+		Peer: peer,
+		Media: &tg.InputMediaUploadedPhoto{
+			File: upload,
+		},
+		Message:  " ",
+		RandomID: generateRandomID(),
+	})
+
+	if err != nil {
+		return fmt.Errorf("не удалось отправить фото: %w", err)
+	}
+
+	log.Printf("✅ Фото отправлено")
+	return nil
+}
+
+// ensureSession обеспечивает рабочую сессию
+func (c *Client) ensureSession(ctx context.Context) (*telegram.Client, error) {
+	client := telegram.NewClient(c.config.APIID, c.config.APIHash, telegram.Options{
+		SessionStorage: &session.FileStorage{
+			Path: c.config.SessionPath,
+		},
+	})
+
+	// Создаем канал для результата
+	resultChan := make(chan error, 1)
+
+	err := client.Run(ctx, func(ctx context.Context) error {
+		api := client.API()
+
+		// Пробуем использовать существующую сессию
+		_, err := api.HelpGetConfig(ctx)
+		if err == nil {
+			log.Printf("✅ Используем сохраненную сессию")
+			resultChan <- nil
+			return nil // Сессия работает
+		}
+
+		// Нужна авторизация
+		fmt.Println("📱 Требуется авторизация...")
+
+		// Удаляем старую сессию если она есть
+		if _, err := os.Stat(c.config.SessionPath); err == nil {
+			os.Remove(c.config.SessionPath)
+		}
+
+		flow := auth.NewFlow(
+			auth.Constant(c.config.Phone, "", auth.CodeAuthenticatorFunc(
+				func(ctx context.Context, sentCode *tg.AuthSentCode) (string, error) {
+					fmt.Print("📱 Введите код из Telegram: ")
+					reader := bufio.NewReader(os.Stdin)
+					code, err := reader.ReadString('\n')
+					if err != nil {
+						return "", err
+					}
+					return strings.TrimSpace(code), nil
+				},
+			)),
+			auth.SendCodeOptions{},
+		)
+
+		if err := client.Auth().IfNecessary(ctx, flow); err != nil {
+			resultChan <- fmt.Errorf("авторизация не удалась: %w", err)
+			return err
+		}
+
+		fmt.Println("✅ Успешно авторизованы!")
+		resultChan <- nil
+		return nil
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	// Ждем завершения инициализации
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case err := <-resultChan:
+		if err != nil {
+			return nil, err
+		}
+		return client, nil
+	}
+}
