@@ -1,26 +1,9 @@
-package ohana
+package mahalo
 
 import (
 	"fmt"
 	"strings"
-	"time"
 )
-
-// Config содержит конфигурацию для подключения к Telegram
-type Config struct {
-	APIID       int
-	APIHash     string
-	Phone       string
-	SessionPath string // опционально, по умолчанию "telegram_session.json"
-}
-
-// BotInfo содержит информацию о созданном бота
-type BotInfo struct {
-	Name      string
-	Username  string
-	Token     string
-	CreatedAt time.Time
-}
 
 // Ошибки BotFather
 const (
@@ -114,7 +97,7 @@ func CheckBotFatherError(message string) error {
 	if strings.Contains(msgLower, "too many attempts") ||
 		strings.Contains(msgLower, "please try again in") {
 		// Извлекаем время ожидания
-		seconds := extractWaitTime(message)
+		seconds := ExtractWaitTime(message)
 		return fmt.Errorf("%s: %d seconds", ErrTooManyAttempts, seconds)
 	}
 
@@ -131,7 +114,7 @@ func CheckBotFatherError(message string) error {
 }
 
 // extractWaitTime извлекает время ожидания из сообщения об ошибке
-func extractWaitTime(message string) int {
+func ExtractWaitTime(message string) int {
 	// Ищем числа в сообщении
 	words := strings.Fields(message)
 	for _, word := range words {
