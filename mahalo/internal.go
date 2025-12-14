@@ -26,25 +26,34 @@ func GenerateRandomID() int64 {
 
 // findBotFather находит пользователя BotFather
 func FindBotFather(ctx context.Context, api *tg.Client) (*tg.InputPeerUser, error) {
+	log.Printf("🔍 Ищем BotFather...")
 	resolved, err := api.ContactsResolveUsername(ctx, &tg.ContactsResolveUsernameRequest{
 		Username: "BotFather",
 	})
 	if err != nil {
+		log.Printf("❌ Ошибка при поиске BotFather: %v", err)
 		return nil, fmt.Errorf("не удалось найти BotFather: %w", err)
 	}
 
+	log.Printf("📋 Найдено пользователей: %d", len(resolved.Users))
 	var botFatherUser *tg.User
-	for _, user := range resolved.Users {
-		if u, ok := user.(*tg.User); ok && u.Username == "BotFather" {
-			botFatherUser = u
-			break
+	for i, user := range resolved.Users {
+		log.Printf("  User %d: %T", i, user)
+		if u, ok := user.(*tg.User); ok {
+			log.Printf("    ID: %d, Username: %s", u.ID, u.Username)
+			if u.Username == "BotFather" {
+				botFatherUser = u
+				break
+			}
 		}
 	}
 
 	if botFatherUser == nil {
+		log.Printf("❌ BotFather не найден в списке пользователей")
 		return nil, fmt.Errorf("BotFather не найден")
 	}
 
+	log.Printf("✅ BotFather найден! ID: %d", botFatherUser.ID)
 	return &tg.InputPeerUser{
 		UserID:     botFatherUser.ID,
 		AccessHash: botFatherUser.AccessHash,
@@ -126,6 +135,18 @@ func WaitForResponseWithChecks(ctx context.Context, api *tg.Client, peer tg.Inpu
 
 			// Проверяем на ошибки BotFather
 			if err := CheckBotFatherError(msg); err != nil {
+				// Если это "too many attempts" — ждём указанное время и повторяем
+				if strings.Contains(err.Error(), ErrTooManyAttempts) {
+					// Извлекаем время ожидания
+					seconds := ExtractWaitTime(msg)
+					if seconds > 0 {
+						log.Printf("⏳ BotFather требует подождать %d сек, ожидаем...", seconds)
+						time.Sleep(time.Duration(seconds) * time.Second)
+						// Сбрасываем дедлайн и повторяем попытку
+						deadline = time.After(timeout)
+						continue
+					}
+				}
 				return "", err
 			}
 

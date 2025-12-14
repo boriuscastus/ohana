@@ -80,7 +80,12 @@ func IsPrompt(message string, keywords []string) bool {
 func FormatCommands(commands map[string]string) string {
 	var builder strings.Builder
 	for command, description := range commands {
-		builder.WriteString(command + " - " + description + "\n")
+		// BotFather expects commands without a leading slash when receiving the list
+		cmd := strings.TrimSpace(command)
+		if strings.HasPrefix(cmd, "/") {
+			cmd = strings.TrimPrefix(cmd, "/")
+		}
+		builder.WriteString(cmd + " - " + description + "\n")
 	}
 	return strings.TrimSpace(builder.String())
 }
